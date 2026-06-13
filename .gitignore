@@ -1,0 +1,22 @@
+# Ignora tudo por padrão
+*
+
+# Libera o .gitignore em si
+!.gitignore
+
+# Libera o README
+!README.md
+
+# Libera as pastas de desafio
+!Desafio1/
+!Desafio2/
+!Desafio3/
+!Desafio4/
+!Desafio5/
+!Desafio6/
+!Desafio7/
+!Desafio8/
+!Desafio9/
+
+# Libera os MDs dentro de cada pasta de desafio
+!Desafio*/relatorio-desafio*.md
