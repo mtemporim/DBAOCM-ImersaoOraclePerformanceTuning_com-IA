@@ -15,3 +15,4 @@ Imersão Oracle da DBAOCM de Performance Tuning com IA — 2 dias de diagnóstic
 | [Desafio 1](Desafio1/relatorio-desafio1.md) | Time Model — onde o banco gasta o tempo? | `V$SYS_TIME_MODEL` |
 | [Desafio 2](Desafio2/relatorio-desafio2.md) | Alert Log & Trace Files (Evento 10046) | `DBMS_MONITOR` · alert log |
 | [Desafio 3](Desafio3/relatorio-desafio3.md) | AWR, ASH & ADDM | `DBMS_WORKLOAD_REPOSITORY` · `DBMS_ADDM` |
+| [Desafio 4](Desafio4/relatorio-desafio4.md) | SQL Diagnosis & Execution Plans | `V$SQL` · `DBMS_XPLAN` |
