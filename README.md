@@ -20,3 +20,4 @@ Imersão Oracle da DBAOCM de Performance Tuning com IA — 2 dias de diagnóstic
 | [Desafio 6](Desafio6/relatorio-desafio6.md) | CBO — Cost-Based Optimizer & Estatísticas | `DBA_TAB_STATISTICS` · `DBMS_STATS` · `DBMS_XPLAN` |
 | [Desafio 7](Desafio7/relatorio-desafio7.md) | Buffer Cache & I/O | `V$BH` · `V$FILESTAT` · `V$SYSTEM_EVENT` · `V$SGAINFO` |
 | [Desafio 8](Desafio8/relatorio-desafio8.md) | PGA, Temp Tablespace & Segments | `V$SQL_WORKAREA_HISTOGRAM` · `V$PGA_TARGET_ADVICE` · `DBA_TEMP_FREE_SPACE` |
+| [Desafio 9](Desafio9/relatorio-desafio9.md) | Cost Reduction: Chaining, HWM & Compressão | `DBA_TABLES.chain_cnt` · `DBA_SEGMENTS` · `ROW STORE COMPRESS ADVANCED` |
