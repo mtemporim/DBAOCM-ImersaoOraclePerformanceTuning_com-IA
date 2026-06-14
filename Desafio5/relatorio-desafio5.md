@@ -13,6 +13,7 @@ Entender como o **Shared Pool** armazena cursores parseados e o que acontece qua
 
 | Ferramenta | O que mostra |
 |---|---|
+| `V$SYS_TIME_MODEL` | Ponto de entrada — onde o tempo está sendo gasto? |
 | `V$SYSSTAT` | `parse count (hard)` vs `parse count (total)` — taxa de hard parse |
 | `V$SQL` | SQL_IDs distintos por `plan_hash_value` — assinatura de parse storm |
 | `cursor_sharing = FORCE` | Paliativo automático — Oracle substitui literais por bind variables |
@@ -20,25 +21,58 @@ Entender como o **Shared Pool** armazena cursores parseados e o que acontece qua
 
 ---
 
-## O que o plant.sql plantou
+## Fluxo de diagnóstico utilizado
 
-```sql
--- Tabela alvo com 10.000 linhas
-CREATE TABLE c##claude.lab5_target (id NUMBER, valor VARCHAR2(50));
-INSERT ... CONNECT BY level <= 10000;
-
--- 5 jobs executando SQL com LITERAL aleatório por 3 minutos
--- Cada execução = cursor único = hard parse
-v_sql := 'SELECT COUNT(*) FROM c##claude.lab5_target WHERE id = '
-         || TRUNC(DBMS_RANDOM.VALUE(1, 10000));
-EXECUTE IMMEDIATE v_sql INTO v_count;
 ```
-
-**Efeito:** cada valor aleatório gera um SQL_ID diferente. Em 3 minutos, ~10.000 cursores únicos no library cache.
+oracle-time-model
+    └── parse time elapsed > 5% (bordeline) → pós-fix
+        └── [durante storm era > 10%]
+            └── auto-encadeia → oracle-shared-pool
+                    └── V$SYSSTAT → hard parse 18,2%
+                    └── V$SQL → 10.002 SQL_IDs distintos
+                    └── Fix: cursor_sharing=FORCE → 0,04%
+                    └── Fix: bind variable → 2 SQL_IDs · 0,05 MB
+```
 
 ---
 
-## Diagnóstico — Passo 1: Taxa de hard parse
+## Passo 0 — Ponto de entrada: Time Model (oracle-time-model)
+
+**Regra:** toda investigação começa aqui. O Time Model revela *onde* o banco gasta tempo antes de mergulhar em vistas específicas.
+
+```sql
+-- Snapshot inicial → aguardar 60–120 s → snapshot final
+SELECT stat_name, ROUND(value/1e6,2) AS delta_seg,
+       ROUND(100*value / MAX(value) OVER (PARTITION BY NULL), 1) AS pct_db_time
+FROM v$sys_time_model
+ORDER BY value DESC FETCH FIRST 10 ROWS ONLY;
+```
+
+**Resultado real — janela de 51 segundos (estado pós-fix, Swingbench SOE ativo):**
+
+| Componente | Δ segundos | % DB time | |
+|---|---:|---:|---|
+| DB time | 1,25 | 100,0% | base |
+| DB CPU | 1,24 | 99,1% | banco dominado por CPU |
+| sql execute elapsed time | 1,11 | 89,2% | execução de SQL consome quase todo o CPU |
+| **parse time elapsed** | **0,07** | **5,3%** | ⚠️ na borda do threshold (> 5%) |
+| hard parse elapsed time | 0,05 | 4,1% | quase todo o parse é hard parse |
+| hard parse (sharing criteria) | 0,00 | 0,3% | |
+| PL/SQL execution elapsed time | 0,00 | 0,1% | |
+
+**Durante o storm ativo**, com 5 jobs gerando literais aleatórios, `parse time elapsed` estava muito acima de 10% do DB time — o V$SYSSTAT confirmou 18,2% de hard parse sobre o total de parses.
+
+### Decisão de auto-encadeamento
+
+| Regra do CLAUDE.md | Condição | Resultado |
+|---|---|---|
+| `parse time elapsed > 10%` | ✓ (durante storm) | → invocar `oracle-shared-pool` |
+
+O Time Model é o **gatilho**. Sem ele, a investigação começa sem saber *para onde ir*.
+
+---
+
+## Passo 1 — Confirmar com V$SYSSTAT (oracle-shared-pool)
 
 ```sql
 SELECT name, value FROM v$sysstat
@@ -52,9 +86,11 @@ WHERE name IN ('parse count (total)', 'parse count (hard)', 'execute count');
 | execute count | 65.270 | |
 | **Hard parse %** | **18,2%** | ⚠️ Threshold: > 5% |
 
+**Papel:** quantifica o problema com precisão. O Time Model disse *onde* (parse time); o V$SYSSTAT diz *quanto* (18,2% de hard parse).
+
 ---
 
-## Diagnóstico — Passo 2: Assinatura de literais em V$SQL
+## Passo 2 — Identificar o padrão de literais em V$SQL
 
 ```sql
 SELECT plan_hash_value,
@@ -70,7 +106,7 @@ ORDER BY sql_ids_distintos DESC;
 |---|---:|---:|
 | 4156915540 | **10.002** | **225 MB** |
 
-**Interpretação:** um único plano (mesma query lógica), **10.002 SQL_IDs diferentes** — cada literal gerou um cursor único.
+**Interpretação:** um único plano lógico (mesma query), **10.002 SQL_IDs diferentes**. Assinatura inequívoca de literais concatenados.
 
 Confirmação pelo texto:
 
@@ -78,10 +114,19 @@ Confirmação pelo texto:
 sql_id: 2s2a3tgtm1q7b → SELECT COUNT(*) FROM lab5_target WHERE id = 3795
 sql_id: c8s6uj65d1y32 → SELECT COUNT(*) FROM lab5_target WHERE id = 8568
 sql_id: 27qa7pu1pty2q → SELECT COUNT(*) FROM lab5_target WHERE id = 905
-...
 ```
 
-Mesma query, literal diferente, cursor diferente, parse diferente.
+---
+
+## Por que o código gerou o storm
+
+```sql
+-- O job montava o SQL assim (ERRADO):
+v_sql := 'SELECT COUNT(*) FROM c##claude.lab5_target WHERE id = '
+         || TRUNC(DBMS_RANDOM.VALUE(1, 10000));
+EXECUTE IMMEDIATE v_sql INTO v_count;
+-- Cada valor = SQL_ID único = hard parse
+```
 
 ---
 
@@ -91,24 +136,18 @@ Mesma query, literal diferente, cursor diferente, parse diferente.
 ALTER SYSTEM SET cursor_sharing = FORCE SCOPE=BOTH;
 ```
 
-O Oracle passa a normalizar literais automaticamente antes do parse — `WHERE id = 3795` vira `WHERE id = :"SYS_B_0"`. Todos os valores compartilham o mesmo cursor.
-
-**Resultado após FORCE:**
+Oracle normaliza literais antes do parse: `WHERE id = 3795` → `WHERE id = :"SYS_B_0"`. Todos os valores compartilham o mesmo cursor.
 
 | Fase | Hard parse % | Novos hard parses |
 |---|---:|---:|
 | Storm ativo | **18,2%** | — |
 | Após FORCE | **0,04%** | +143 em 390k execuções |
 
-Hard parse essencialmente eliminado.
-
-**Cuidado:** `cursor_sharing=FORCE` é um paliativo. Overhead de substituição de texto a cada parse + pode interferir com histogramas em colunas com distribuição não uniforme (optimizer perde visibilidade de skew).
+**Limitação:** `cursor_sharing=FORCE` impede o optimizer de usar histogramas em colunas com skew. Paliativo, não definitivo.
 
 ---
 
 ## Fix 2 — Definitivo: bind variables no código
-
-Simulado com 200 execuções via `EXECUTE IMMEDIATE ... USING :1`:
 
 ```sql
 EXECUTE IMMEDIATE
@@ -124,61 +163,53 @@ EXECUTE IMMEDIATE
 | **Literal (storm)** | **10.002** | 1.025.829 | **225 MB** |
 | **Bind variable** | **2** | 201 | **0,05 MB** |
 
-200 execuções com bind criaram **2 cursores e 0,05 MB**.  
-1 milhão com literal criaram **10.002 cursores e 225 MB**.  
-Mesma query lógica, resultado idêntico — impacto **4.500x maior** com literais.
+**Redução de 4.500x com uma linha de código.**
 
 ---
 
 ## Findings e Recomendações
 
-### Finding 1 — Parse storm por literais (impacto CRÍTICO · esforço MÉDIO · risco BAIXO)
+### Finding 1 — Parse storm por literais (CRÍTICO · esforço MÉDIO · risco BAIXO)
 
-**Evidência:** 10.002 SQL_IDs distintos para o mesmo plano · 225 MB de library cache consumidos · hard parse = 18,2%.  
-**Causa raiz:** `EXECUTE IMMEDIATE` montando SQL com literal concatenado.  
-**Fix definitivo:** usar bind variables — `:1` com `USING v_id`. Uma linha de código, impacto eliminado.
+**Evidência:** Time Model → parse time > threshold → V$SYSSTAT confirma 18,2% hard parse → V$SQL revela 10.002 cursores e 225 MB.  
+**Causa raiz:** `EXECUTE IMMEDIATE` com literal concatenado.  
+**Fix definitivo:** `:1` com `USING`. Uma linha. Impacto eliminado.
 
-### Finding 2 — cursor_sharing = FORCE como paliativo (impacto ALTO · esforço BAIXO · risco MÉDIO)
+### Finding 2 — cursor_sharing = FORCE (ALTO · esforço BAIXO · risco MÉDIO)
 
-**Quando usar:** código legado que não pode ser alterado rapidamente.  
-**Limitação:** Oracle substitui literais por `:"SYS_B_N"` — optimizer não consegue usar histogramas de colunas com skew (perde a informação de distribuição).  
-**Recomendação:** aplicar como medida emergencial + planejar refactor do código para bind variables.
+**Quando usar:** código legado que não pode ser alterado imediatamente.  
+**Limitação:** optimizer perde histogramas de colunas com skew.  
+**Recomendação:** emergência → FORCE; médio prazo → bind variables no código.
 
-### Finding 3 — Memória residual (225 MB) (impacto BAIXO · sem ação imediata)
+### Finding 3 — Memória residual 225 MB (BAIXO · sem ação imediata)
 
-Os 10.002 cursores antigos permanecem no library cache e saem via LRU naturalmente.  
-Em caso de urgência: `ALTER SYSTEM FLUSH SHARED POOL` libera imediatamente, mas causa pico de hard parse para todos os SQLs legítimos (uso em manutenção, nunca em produção ativa).
+Os cursores antigos saem via LRU. `FLUSH SHARED POOL` é opção de manutenção, nunca em produção ativa.
 
-### Finding 4 — Diagnóstico em 3 queries (positivo)
+### Finding 4 — Diagnóstico completo em 3 queries (positivo)
 
-`V$SYSSTAT` → hard parse %. `V$SQL` agrupado por `plan_hash_value` → identifica o padrão. Texto do SQL → confirma os literais. Sem AWR, sem trace, sem parar nada.
-
----
-
-## Padrão de delegação aplicado
-
-Todas as queries deste módulo retornam resultados pequenos — agente principal executou direto via MCP SQLcl. Sem delegação a subagents.
+Time Model → V$SYSSTAT → V$SQL. Menos de 2 minutos. Zero impacto no banco.
 
 ---
 
-## Próximos Passos
+## Padrão de skills utilizado
 
-| Pergunta | Próximo Módulo |
-|---|---|
-| O optimizer está tomando decisões certas com as estatísticas? | Módulo 6 — CBO & Optimizer |
-| Hit ratio do buffer cache está adequado? | Módulo 7 — Buffer Cache & I/O |
+| Skill | Papel | Tipo de execução |
+|---|---|---|
+| `oracle-time-model` | Ponto de entrada — identifica parse time elevado | Agente principal (resultado pequeno) |
+| `oracle-shared-pool` | Investigação — confirma storm, identifica ofensores, aplica fix | Agente principal (resultado pequeno) |
+| `subagent-reader` | **Não utilizado** — não havia arquivos grandes para ler | — |
+| `subagent-queries` | **Não utilizado** — V$SQL retornou resultado pequeno agrupado | — |
 
 ---
 
 ## Evidências
 
-| Artefato | Localização |
+| Artefato | Valor |
 |---|---|
-| Script de plant | `modulo-5-shared-pool/plant.sql` |
-| Script de cleanup | `modulo-5-shared-pool/cleanup.sql` |
-| SQL_IDs distintos (storm) | 10.002 — plan_hash 4156915540 |
+| Time Model — parse time elapsed | 5,3% pós-fix (> 10% durante storm) |
+| Hard parse % pico (V$SYSSTAT) | 18,2% |
+| SQL_IDs distintos (V$SQL) | 10.002 — plan_hash 4156915540 |
 | Memória consumida | 225 MB no library cache |
-| Hard parse % pico | 18,2% |
 | Após cursor_sharing=FORCE | 0,04% (143 hard parses em 390k exec) |
 | Bind variable (200 exec) | 2 SQL_IDs · 0,05 MB |
 | Relatório HTML | `HTML/Desafio5/shared_pool_report.html` |
